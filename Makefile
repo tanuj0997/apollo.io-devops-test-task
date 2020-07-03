@@ -7,4 +7,4 @@ push-webserver:
 	@docker push ${IMAGE_NAME}:${TAG}
 
 install-webserver:
-	@helm upgrade --install webserver charts/webserver
+	@helm upgrade --install webserver charts/webserver -f ./charts/webserver/values.yaml
