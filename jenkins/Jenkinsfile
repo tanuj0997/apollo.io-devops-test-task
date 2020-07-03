@@ -1,0 +1,432 @@
+def build_push_image(service_dir, svc_name) {
+
+  withCredentials([file(credentialsId: 'gcloud-key', variable: 'CI_GOOGLE_SA_JSON_FILE')]){
+    set_image_tag(service_dir)
+
+    dir(service_dir){
+      def image_tag = image_tags[service_dir]
+      def image_url = "${cr_registry_base}/${ci_google_project_id}/${svc_name}"
+      echo "build_push_image ${image_tag}"
+
+      def image_cr_status = sh(returnStdout: true, script: "gcloud container images list-tags ${cr_registry_base}/${ci_google_project_id}/${svc_name} \
+                                --format=\"json\" | jq '.[].tags | select(index(\"${image_tag}\"))'").trim()
+      echo "image_status ${image_cr_status}"
+
+      if (skip_test == "No" || image_cr_status == null || image_cr_status == '' || image_cr_status.size() <= 0){
+        stage("Pull image ${svc_name}"){
+          sh "${gcloud} auth activate-service-account ${gcloud_login_sa_id} --key-file=${CI_GOOGLE_SA_JSON_FILE} && \
+              cat ${CI_GOOGLE_SA_JSON_FILE} | docker login -u _json_key --password-stdin https://${cr_registry_base} && \
+              docker pull ${image_url}:latest || true && \
+              docker tag ${image_url}:latest apollo-dev-start_jenkins_${svc_name}:latest || true"
+        }
+      }
+
+      if(image_cr_status == null || image_cr_status == '' || image_cr_status.size() <= 0){
+        stage("build using cache & tag image ${svc_name}"){
+          sh "docker build --cache-from=${image_url}:latest \
+              --build-arg NODE_ENV=development \
+              --build-arg ASDF_CODE_VERSION=${asdf_commit} \
+              --build-arg SCHEMAS_CODE_VERSION=${scheme_commit} \
+              -t ${image_url}:${image_tag}  \
+              -f Dockerfile . && \
+              docker tag ${image_url}:${image_tag} ${image_url}:latest && \
+              docker tag ${image_url}:${image_tag} apollo-dev-start_jenkins_${svc_name}:latest"
+        }
+        stage("push image ${svc_name}"){
+          withCredentials([file(credentialsId: 'gcloud-key', variable: 'CI_GOOGLE_SA_JSON_FILE')]){
+            sh "${gcloud} auth activate-service-account ${gcloud_login_sa_id} --key-file=${CI_GOOGLE_SA_JSON_FILE} && \
+                cat ${CI_GOOGLE_SA_JSON_FILE} | docker login -u _json_key --password-stdin https://${cr_registry_base} && \
+                docker push ${image_url}:${image_tag} && \
+                docker push ${image_url}:latest"
+          }
+        }
+      }
+    }
+  }
+}
+
+
+def set_image_tag(service_dir){
+  def git_dir_hash = sh(returnStdout: true, script: "git rev-parse --short HEAD:${service_dir}").trim()
+  image_tags[service_dir] = "${git_dir_hash}-${asdf_commit}-${scheme_commit}"
+}
+
+def deploy_helm (chart_dir, chart_name, kube_cluster, kube_namespace, kube_region, kube_context, google_projects, params) {
+  dir(chart_dir){
+    sh "${gcloud} container clusters get-credentials ${kube_cluster} --region=${kube_region} --project ${google_projects} && \
+        helm upgrade ${chart_name} \
+        --kube-context=${kube_context} \
+        --debug \
+        --install . --namespace=${kube_namespace} \
+        ${params}"
+  }
+}
+
+def deploy_configs (chart_dir, kube_cluster, kube_namespace, kube_region, kube_context, google_projects) {
+  dir(chart_dir){
+    sh "${gcloud} container clusters get-credentials ${kube_cluster} --region=${kube_region} --project ${google_projects} && \
+        make configs-deploy-${env.BRANCH_NAME}"
+  }
+}
+
+def get_deployed_image_tag(svc, kube_cluster, kube_region, google_projects) {
+  tag = sh(returnStdout: true, script: "${gcloud} container clusters get-credentials ${kube_cluster} --region=${kube_region} --project ${google_projects} && \
+    kubectl get deployment -l app.kubernetes.io/name=${svc} -o json | jq '.items[] | select(.metadata.name == \"${svc}\")' | jq '.spec.template.spec.containers[] | select(.name == \"${svc}\")' | jq .image | tr -d '\"'  | cut -d':' -f2").trim()
+  return tag
+}
+
+def deploy_svc (service_dir, svc_name, kube_cluster, kube_namespace, kube_region, kube_context, google_projects){
+  def image_tag = image_tags[service_dir]
+  def deployed_image_tag = get_deployed_image_tag(svc_name, kube_cluster, kube_region, google_projects)
+
+  echo "*** The deployed tag is:  ${deployed_image_tag} ***\n*** The latest tag is: ${image_tag} ***"
+
+  if (deployed_image_tag != image_tag){
+    echo "Different tags for ${svc_name}"
+  } else {
+    echo "Same tags for ${svc_name}"
+    return
+  }
+
+  def image_url = "${cr_registry_base}/${ci_google_project_id}/${svc_name}"
+  deploy_helm(
+    "${service_dir}/k8s/${svc_name}/",
+    svc_name,
+    kube_cluster,
+    kube_namespace,
+    kube_region,
+    kube_context,
+    google_projects,
+    "--set=image.repository=${image_url} --set=image.tag=${image_tag}"
+  )
+}
+
+
+def label_slave = "mypod-${UUID.randomUUID().toString()}"
+podTemplate(
+    label: label_slave,
+    containers: [
+      containerTemplate(
+        name: 'jenkins-dind',
+        image: 'apollo/custom-dind:v9',
+        alwaysPullImage: true,
+        privileged: true,
+        ttyEnabled: true,
+        command: 'dockerd-entrypoint.sh',
+        resourceRequestCpu: '3000m',
+        resourceRequestMemory: '4000Mi',
+      )
+    ],
+    volumes: [emptyDirVolume(mountPath: '/var/lib/docker', memory: false)],
+    nodeSelector: 'cloud.google.com/gke-preemptible: "true"',
+    slaveConnectTimeout: 9000,
+    // idleMinutes: 100
+  )
+{
+  node(label_slave) {
+    properties(
+      [
+        parameters(
+          [
+            choice(name: 'skip_test', choices:"No\nYes", description: "Do you whish to Run test cases ?" )
+          ]
+        )
+      ]
+    )
+    container('jenkins-dind'){
+
+      environment {
+        image_tags = [:]
+        cr_registry_base = "fake"
+        ci_google_project_id = "fake"
+        gcloud_login_sa_id = "fake"
+        gcloud_login_sa_json_jenkins_cred_id = "fake"
+        gcloud = "fake"
+        asdf_commit = "fake"
+        scheme_commit = "fake"
+      }
+
+      parameters {
+        booleanParam(defaultValue: true, description: 'Wether to skip testing or not', name: 'skipTest')
+      }
+
+      stage('Assign variable'){
+        image_tags = [:]
+        cr_registry_base = "us.gcr.io"
+        ci_google_project_id = "apollo-ci"
+        gcloud_login_sa_id = "jenkins-ci@apollo-ci.iam.gserviceaccount.com"
+        gcloud_login_sa_json_jenkins_cred_id = "gcloud-key"
+        gcloud = "/root/google-cloud-sdk/bin/gcloud"
+        // def userInput = input(
+        //     id: 'userInput', message: 'This is PRODUCTION!', parameters: [
+        //     [$class: 'BooleanParameterDefinition', defaultValue: false, description: '', name: 'Please confirm you sure to proceed']
+        // ])
+      }
+
+      stage('Get cluster credentials'){
+       withCredentials([file(credentialsId: "${gcloud_login_sa_json_jenkins_cred_id}", variable: 'CI_GOOGLE_SA_JSON_FILE')]){
+          sh "${gcloud} auth activate-service-account ${gcloud_login_sa_id} --key-file=${CI_GOOGLE_SA_JSON_FILE}"
+        }
+      }
+
+      stage('Build asdf & schemas'){
+      git (url: 'git@bitbucket.org:apollosportsv2/apollo-dev-start.git', branch: env.BRANCH_NAME , credentialsId: 'bitbucket_ssh_key')
+        withCredentials([file(credentialsId: 'gcloud-key', variable: 'CI_GOOGLE_SA_JSON_FILE')]){
+
+          asdf_commit = sh(returnStdout: true, script: 'git rev-parse --short HEAD:common/asdf').trim()
+          scheme_commit = sh(returnStdout: true, script: 'git rev-parse --short HEAD:common/schemas').trim()
+
+          stage("pull image asdf & schemas"){
+            sh "${gcloud} auth activate-service-account ${gcloud_login_sa_id} --key-file=${CI_GOOGLE_SA_JSON_FILE} && \
+                cat ${CI_GOOGLE_SA_JSON_FILE} | docker login -u _json_key --password-stdin https://${cr_registry_base} && \
+                docker pull ${cr_registry_base}/${ci_google_project_id}/asdf:${asdf_commit} || true && \
+                docker pull ${cr_registry_base}/${ci_google_project_id}/schemas:${scheme_commit} || true"
+          }
+
+          dir('common') {
+            dir('asdf') {
+              def image_url = "${cr_registry_base}/${ci_google_project_id}/asdf"
+              sh "docker build --cache-from=${image_url}:${asdf_commit} \
+                  --build-arg NODE_ENV=development \
+                  -t ${image_url}:${asdf_commit}  \
+                  -f Dockerfile ."
+              sh "docker tag ${image_url}:${asdf_commit} asdf:latest"
+              sh "docker tag ${image_url}:${asdf_commit} asdf:${asdf_commit}"
+              sh "docker push ${image_url}:${asdf_commit}"
+            }
+          }
+
+          dir('common') {
+            dir('schemas') {
+              dir('v3'){
+                def image_url = "${cr_registry_base}/${ci_google_project_id}/schemas"
+                sh "docker build --cache-from=${image_url}:${scheme_commit} \
+                  --build-arg NODE_ENV=development \
+                  -t ${image_url}:${scheme_commit}  \
+                  -f Dockerfile ."
+                sh "docker tag ${image_url}:${scheme_commit} schemas:latest"
+                sh "docker tag ${image_url}:${scheme_commit} schemas:${scheme_commit}"
+                sh "docker push ${image_url}:${scheme_commit}"
+              }
+            }
+          }
+
+        }
+      }
+
+      stage('Build ALL Docker images'){
+        parallel(
+          svc1: {
+            build_push_image('svc1','svc1')
+          },
+          svc2: {
+            build_push_image('svc2','svc2')
+          },
+          svc3: {
+            build_push_image('svc3','svc3')
+          },
+          svc4: {
+            build_push_image('svc4','svc4')
+          },
+          svc5: {
+            build_push_image('svc5','svc5')
+          },
+          svc6: {
+            build_push_image('svc6','svc6')
+          },
+          svc7: {
+            build_push_image('svc7','svc7')
+          },
+        )
+        parallel(
+          svc8: {
+            build_push_image('svc8','svc8')
+          },
+          svc9: {
+            build_push_image('svc9', 'svc9')
+          },
+          svc10: {
+            build_push_image('svc10','svc10')
+          },
+          svc11: {
+            build_push_image('svc11','svc11')
+          },
+          svc12: {
+            build_push_image('svc12','svc12')
+          },
+          svc13: {
+            build_push_image('svc13','svc13')
+          },
+          svc14: {
+            build_push_image('svc14','svc14')
+          },
+        )
+        parallel(
+          svc14: {
+            build_push_image('svc14','svc14')
+          },
+          svc15: {
+            build_push_image('svc15','svc15')
+          },
+          svc16: {
+            build_push_image('svc16','svc16')
+          },
+          svc17: {
+            build_push_image('svc17','svc17')
+          },
+          svc18: {
+            build_push_image('svc18','svc18')
+          },
+          svc19: {
+            build_push_image('svc19','svc19')
+          }
+        )
+      }
+
+      if (skip_test == "No"){
+        stage('Run integration test'){
+          sh "make services-up && make set-up-db && make test"
+        }
+      }
+
+        def kube_cluster = ""
+        def kube_namespace = ""
+        def kube_region = "us-central1"
+        def kube_context = ""
+        def google_project = ""
+        def skip_helm_upgrade = false
+
+        switch (env.BRANCH_NAME) {
+          case 'staging':
+            kube_cluster = "apollo-staging"
+            kube_context = "gke_apollo-dev-241610_us-central1_apollo-staging"
+            google_project = "apollo-dev-241610"
+            break
+          case 'rc1':
+            kube_cluster = "apollo-rc1"
+            kube_context = "gke_apollo-rc1_us-central1_apollo-rc1"
+            google_project = "apollo-rc1"
+            break
+          case 'rc2':
+            kube_cluster = "apollo-rc2"
+            kube_context = "gke_apollo-rc2_us-central1_apollo-rc2"
+            google_project = "apollo-rc2"
+            break
+          case 'production':
+            kube_cluster = "production-apollo"
+            kube_context = "gke_apollo-production-241312_us-central1_production-apollo"
+            google_project = "apollo-production-241312"
+            break
+          default:
+            skip_helm_upgrade = true
+        }
+
+      if (skip_helm_upgrade != true){
+        stage('HELM upgrade image') {
+
+          switch(env.BRANCH_NAME) {
+            case 'staging':
+              withCredentials([file(credentialsId:'gcloud-key-staging', variable: 'STAGING_GOOGLE_SA_JSON_FILE')]){
+                sh "${gcloud} auth activate-service-account jenkins@apollo-dev-241610.iam.gserviceaccount.com --key-file=${STAGING_GOOGLE_SA_JSON_FILE}"
+              }
+              break
+            case 'rc1':
+              withCredentials([file(credentialsId:'gcloud-key-rc1', variable: 'RC1_GOOGLE_SA_JSON_FILE')]){
+                sh "${gcloud} auth activate-service-account jenkins@apollo-rc1.iam.gserviceaccount.com --key-file=${RC1_GOOGLE_SA_JSON_FILE}"
+              }
+              break
+            case 'rc2':
+              withCredentials([file(credentialsId:'gcloud-key-rc2', variable: 'RC2_GOOGLE_SA_JSON_FILE')]){
+                sh "${gcloud} auth activate-service-account jenkins@apollo-rc2.iam.gserviceaccount.com --key-file=${RC2_GOOGLE_SA_JSON_FILE}"
+              }
+              break
+            case 'production':
+              withCredentials([file(credentialsId:'gcloud-key-production', variable: 'PRODUCTION_GOOGLE_SA_JSON_FILE')]){
+                sh "${gcloud} auth activate-service-account jenkins@apollo-production-241312.iam.gserviceaccount.com --key-file=${PRODUCTION_GOOGLE_SA_JSON_FILE}"
+              }
+              break
+          }
+          // deploy_svc (service_dir, svc_name, kube_cluster, kube_namespace, kube_region, kube_context, google_projects)
+          svc1: {
+            deploy_configs('deployment/charts/', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+
+          svc2: {
+            deploy_svc('svc2','svc2', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+
+          svc3: {
+            deploy_svc('svc3','svc3', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+
+          svc4: {
+            deploy_svc('svc4','svc4', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+          svc5: {
+            deploy_svc('svc5','svc5', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+          svc6: {
+            deploy_svc('svc6','svc6', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+          svc7: {
+            deploy_svc('svc7','svc7', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+          svc8: {
+            deploy_svc('svc8','svc8', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+            // sh "${gcloud} container clusters get-credentials ${kube_cluster} --region=${kube_region} --project ${google_project} && \
+            //   kubernetes-run default ${kube_context} ./node_modules/.bin/typeorm migration:run --template=profile"
+          }
+          svc9: {
+            deploy_svc('svc9','svc9', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+          svc10: {
+            deploy_svc('svc10','svc10', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+          svc11: {
+            deploy_svc('svc11','svc11', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+            // sh "${gcloud} container clusters get-credentials ${kube_cluster} --region=${kube_region} --project ${google_project} && \
+            //   kubernetes-run default ${kube_context} ./node_modules/.bin/typeorm migration:run --template=economy"
+          }
+          svc12: {
+            deploy_svc('svc12','svc12', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+          svc13: {
+            deploy_svc('svc13','svc13', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+            // sh "${gcloud} container clusters get-credentials ${kube_cluster} --region=${kube_region} --project ${google_project} && \
+            //   kubernetes-run default ${kube_context} ./node_modules/.bin/typeorm migration:run --template=fight"
+          }
+          svc14: {
+            deploy_svc('svc14','svc14', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+          svc15: {
+            deploy_svc('svc15','svc15', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+            // sh "${gcloud} container clusters get-credentials ${kube_cluster} --region=${kube_region} --project ${google_project} && \
+            //   kubernetes-run default ${kube_context} ./node_modules/.bin/typeorm migration:run --template=follower"
+          }
+          svc16: {
+            deploy_svc('svc16','svc16', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+            // sh "${gcloud} container clusters get-credentials ${kube_cluster} --region=${kube_region} --project ${google_project} && \
+            //   kubernetes-run default ${kube_context} ./node_modules/.bin/typeorm migration:run --template=gamelayer"
+          }
+          svc16: {
+            deploy_svc('svc16','svc16', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+            // sh "${gcloud} container clusters get-credentials ${kube_cluster} --region=${kube_region} --project ${google_project} && \
+            //   kubernetes-run default ${kube_context} ./node_modules/.bin/typeorm migration:run --template=identity"
+          }
+          svc17: {
+            deploy_svc('svc17','svc17', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+          svc18: {
+            deploy_svc('svc18','svc18', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+          svc98: {
+            deploy_svc('svc98','svc98', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+          svc20: {
+            deploy_svc('svc20','svc20', kube_cluster, kube_namespace, kube_region, kube_context, google_project)
+          }
+        }
+      }
+    }
+  }
+}
