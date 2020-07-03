@@ -1,0 +1,23 @@
+- hosts: all
+  gather_facts: False
+
+  vars:
+   - MyMessage: "Hello world"
+
+  pre_tasks:
+  - name: install python 2
+    raw: test -e /usr/bin/python || (apt -y update && apt install -y python-minimal)
+
+  tasks:
+    - name: Nginx setup
+      apt: pkg=nginx state=latest update_cache=true
+    - name: apt - add key for passenger repos
+      apt_key: url=http://keyserver.ubuntu.com/pks/lookup?op=get&search=0x561F9B9CAC40B2F7 id=AC40B2F7 state=present
+    - name: apt - add support for https
+      apt: pkg={{ item }} state=installed update_cache=yes cache_valid_time=3600
+      with_items:
+        - apt-transport-https
+        - ca-certificates
+    - name: index.html copy
+      template: src=index.html.j2 dest=/usr/share/nginx/html/index.html
+  
