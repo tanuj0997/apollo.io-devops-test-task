@@ -5,7 +5,7 @@ provider "google" {
 }
 
 resource "google_compute_instance" "vm_instance" {
-  name         = "apollo_tt_instance"
+  name         = "apollo-tt-instance"
   machine_type = "f1-micro"
 
   tags = ["test-webserver"]
@@ -34,17 +34,12 @@ resource "google_compute_network" "vpc_network" {
 }
 
 resource "google_compute_firewall" "default" {
-  name    = "test-firewall"
+  name    = "apollo-tt-firewall"
   network = google_compute_network.vpc_network.name
 
   allow {
-    protocol = "ssh"
-    ports    = "22"
-  }
-
-  allow {
     protocol = "tcp"
-    ports    = ["80", "8080", "443"]
+    ports    = ["80", "8080", "443", "22"]
   }
 
   target_tags = ["test-webserver"]
