@@ -1,4 +1,7 @@
-- hosts: all
+---
+- name: Setting up nginx and passenger
+  become: true
+  hosts: all
   gather_facts: False
 
   vars:
@@ -10,17 +13,49 @@
 
   tasks:
     - name: apt - add support for https
-      apt: pkg={{ item }} state=installed update_cache=yes cache_valid_time=3600
-      with_items:
-        - apt-transport-https
-        - ca-certificates
+      apt:  
+        state: present 
+        update_cache: yes 
+        cache_valid_time: 3600
+        pkg:
+          - apt-transport-https
+          - ca-certificates
+          - dirmngr
+          - gnupg
 
     - name: Nginx setup
       apt: pkg=nginx state=latest update_cache=true
 
     - name: apt - add key for passenger repos
-      apt_key: url=http://keyserver.ubuntu.com/pks/lookup?op=get&search=0x561F9B9CAC40B2F7 id=AC40B2F7 state=present
-  
+      apt_key: 
+        keyserver: keyserver.ubuntu.com
+        id: 561F9B9CAC40B2F7
+        state: present
+
+    - apt_repository:
+        repo: deb https://oss-binaries.phusionpassenger.com/apt/passenger stretch main
+        state: present
+        filename: passenger
+        update_cache: yes
+
+    # - name: Setup passenger repository
+    #   raw:  sh -c 'echo  deb https://oss-binaries.phusionpassenger.com/apt/passenger stretch main > /etc/apt/sources.list.d/passenger.list' && apt-get -y update
+
+    - name: Install passenger package
+      apt:
+        name: passenger
+        pkg: libnginx-mod-http-passenger
+        state: present
+        update_cache: yes
+
+    - name: Install passenger nginx conf
+      raw: if [ ! -f /etc/nginx/modules-enabled/50-mod-http-passenger.conf ]; then sudo ln -s /usr/share/nginx/modules-available/mod-http-passenger.load /etc/nginx/modules-enabled/50-mod-http-passenger.conf ; fi
+
+    - name: Restart service nginx, in all cases
+      service:
+        name: nginx
+        state: restarted
+
     # - name: index.html copy
     #   template: src=index.html.j2 dest=/usr/share/nginx/html/index.html
-  
+# ansible-playbook nginx_install.yaml -i hosts.yaml -u apollo 
