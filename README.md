@@ -15,7 +15,7 @@ docker login -u <username> -p <password>
 
 - Push the docker image
 ```bash
-make push-webserver
+make IMAGE_NAME="webserver" push-webserver
 ```
 
 - Install Kubernetes Helm chart for webserver
