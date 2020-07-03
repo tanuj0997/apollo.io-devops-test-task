@@ -1,0 +1,7 @@
+all:
+  hosts:
+    apollo:
+      ansible_host: 35.184.201.35
+      ip: 35.184.201.35 # 172.31.32.12
+      access_ip: 35.184.201.35
+      ansible_ssh_private_key_file: ~/.ssh/apollo
